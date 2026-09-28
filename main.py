@@ -1,68 +1,118 @@
-import argparse
-import utils.promptbased.Results as PBResults
-import utils.promptbased.train as PB
-from utils.preprocessing import preprocess
-from utils.DisplayImage import display_image
-from utils.promptbased.PromptBuilder import prompt_engineering
-from utils.Analysis import compare_embeddings
+from functools import lru_cache
+from threading import Lock
+
+import gradio as gr
 
 
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('-m', '--mode', type=str, required=True,choices=['train','load_pretrained'])
-    parser.add_argument('-t', '--type', type=str, choices=['Prompt-Based', 'Direct-Conditional'], help='choose which type of fine-tuning to do: Prompt-Based or Direct-Conditional')
-    parser.add_argument('--plot', action='store_true', help='Plot the data distribution info')
-    parser.add_argument('--img', action='store_true', help="Display random image from the dataset")
-    parser.add_argument('--resolution', default=512, type=int, help='The desired image dimension')
-    parser.add_argument('--learning_rate', type=str, help='learning rate for fine-tuning')
-    parser.add_argument('--epochs', default=1, type=int, help='Training epochs')
-    parser.add_argument('--output', type=str, help='output directory for training weights')
-    parser.add_argument('--LoRA_weights', type=str, help='path to LoRA weights')
-    parser.add_argument('--prompt', type=str, help='enter prompt used for generation', default='Dermoscopy image of a melanoma on the upper back of a 65-year-old male.')
-    parser.add_argument('--num_inf_steps', type=int, default=30, help='number of inference steps during generations')
-    parser.add_argument('--guidance_scale', type=int, default=7.5, help='guidance scale for prompt generation')
-    parser.add_argument('--analyze_results', action="store_true", help="analyze embeddings of the generated images")
-    parser.add_argument('--generated_directory', default='./results/', help='path to generated image directory')
-    parser.add_argument('--simulate_queuing', action='store_true', help='simulate generation of images to calculate average time')
-    
-    args = parser.parse_args()
-    
-    if args.img:
-            display_image(data)
-    
-    if args.mode == 'train':
-        data = preprocess(args.plot)
-    
-        if args.type == 'Prompt-Based':
-            missing = [arg for arg in ['resolution', 'learning_rate', 'epochs', 'output'] if getattr(args, arg) is None]
-            if missing:
-                parser.error(f"When --mode=train, you must specify: {', '.join('--' + m for m in missing)}")
-            
-            prompt_engineering(data)
-            PB.create_unified_file(data)
-            PB.train(args.resolution, args.learning_rate, args.epochs, args.output)
-            print('LoRA weights saved')
-            
-        elif args.type == 'Direct-Conditional':
-            pass
-        
-    elif args.mode == 'load_pretrained':
-        if args.type == 'Prompt-Based':
-            if not args.LoRA_weights:
-                parser.error(f"When --mode=load_pretrained, you must specify LoRA weights path")
-            if args.simulate_queuing:
-                times = PBResults.sample_finetuned(args.prompt, args.LoRA_weights, args.num_inf_steps, args.guidance_scale, generate=200)
-                
-            image_base = PBResults.sample_base(args.prompt, args.num_inf_steps, args.guidance_scale)
-            image_finetuned = PBResults.sample_finetuned(args.prompt, args.LoRA_weights, args.num_inf_steps, args.guidance_scale)
-            PBResults.display_results(image_base, image_finetuned)
-            
-            if args.analyze_results:
-                compare_embeddings(args.generated_directory + "prompt based/finetuned_model.png", args.prompt)
-                
-        
+MODEL_ID = "runwayml/stable-diffusion-v1-5"
+_generation_lock = Lock()
+_active_lora = None
 
 
-if __name__ == '__main__':
-    main()
+@lru_cache(maxsize=1)
+def load_pipeline():
+    import torch
+    from diffusers import AutoPipelineForText2Image
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    pipeline = AutoPipelineForText2Image.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+    ).to(device)
+
+    return pipeline, device
+
+
+def set_lora_weights(pipeline, lora_weights):
+    global _active_lora
+
+    if lora_weights == _active_lora:
+        return
+    if _active_lora:
+        pipeline.unload_lora_weights()
+        _active_lora = None
+    if lora_weights:
+        pipeline.load_lora_weights(lora_weights)
+    _active_lora = lora_weights
+
+
+def generate_image(prompt, history, lora_weights, steps, guidance_scale, seed):
+    history = list(history or [])
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return history, None, ""
+
+    history.append({"role": "user", "content": prompt})
+    try:
+        import torch
+
+        with _generation_lock:
+            pipeline, device = load_pipeline()
+            set_lora_weights(pipeline, (lora_weights or "").strip())
+            generator = None
+            if seed >= 0:
+                generator = torch.Generator(device=device).manual_seed(int(seed))
+
+            image = pipeline(
+                prompt,
+                num_inference_steps=int(steps),
+                guidance_scale=float(guidance_scale),
+                generator=generator,
+            ).images[0]
+        history.append({"role": "assistant", "content": "Image generated."})
+        return history, image, ""
+    except Exception as error:
+        history.append({"role": "assistant", "content": f"Generation failed: {error}"})
+        return history, None, ""
+
+
+with gr.Blocks(
+    title="Medsynth",
+    theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"),
+    css="""
+    .gradio-container { max-width: 1240px !important; }
+    .app-header { padding: 1.25rem 0 .5rem; }
+    .app-header h1 { margin-bottom: .25rem; }
+    .result-panel { border-left: 1px solid var(--border-color-primary); padding-left: 1rem; }
+    """,
+) as app:
+    gr.Markdown(
+        "# Medsynth\nDescribe a dermoscopic image to generate. Generations are synthetic and not for diagnosis.",
+        elem_classes="app-header",
+    )
+    with gr.Row():
+        with gr.Column(scale=5):
+            chatbot = gr.Chatbot(
+                type="messages",
+                height=490,
+                placeholder="Your image-generation conversation will appear here.",
+                label="Conversation",
+            )
+            with gr.Row():
+                prompt = gr.Textbox(
+                    placeholder="Describe a skin lesion and its clinical context...",
+                    label="Prompt",
+                    lines=2,
+                    scale=8,
+                )
+                send = gr.Button("Generate", variant="primary", scale=1)
+        with gr.Column(scale=4, elem_classes="result-panel"):
+            image_output = gr.Image(label="Generated image", type="pil", height=420)
+            with gr.Accordion("Generation settings", open=False):
+                lora_weights = gr.Textbox(
+                    label="LoRA weights path (optional)",
+                    placeholder="Path to a trained LoRA adapter",
+                )
+                steps = gr.Slider(1, 50, value=25, step=1, label="Inference steps")
+                guidance_scale = gr.Slider(1, 15, value=7.5, step=0.5, label="Guidance scale")
+                seed = gr.Number(value=-1, precision=0, label="Seed (-1 for random)")
+
+    inputs = [prompt, chatbot, lora_weights, steps, guidance_scale, seed]
+    outputs = [chatbot, image_output, prompt]
+    prompt.submit(generate_image, inputs=inputs, outputs=outputs, show_api=False)
+    send.click(generate_image, inputs=inputs, outputs=outputs, show_api=False)
+
+
+if __name__ == "__main__":
+    app.queue().launch()

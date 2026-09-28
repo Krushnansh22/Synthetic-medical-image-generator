@@ -1,0 +1,16 @@
+accelerate==0.34.2
+datasets==3.1.0
+diffusers==0.31.0
+gradio==5.9.1
+huggingface-hub==0.26.2
+matplotlib==3.9.2
+numpy==1.26.4
+pandas==2.2.3
+peft==0.13.2
+Pillow==10.4.0
+safetensors==0.4.5
+seaborn==0.13.2
+torch==2.2.2
+torchvision==0.17.2
+tqdm==4.67.1
+transformers==4.44.2
