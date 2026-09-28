@@ -1,0 +1,10 @@
+data/
+LoRA Weights/
+.DS_Store
+results/
+__pycache__/
+./__pycache__
+.venv/
+env/
+.ipynb_checkpoints/
+*.py[cod]
