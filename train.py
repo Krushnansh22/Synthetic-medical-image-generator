@@ -171,7 +171,7 @@ DEFAULT_VALIDATION_PROMPTS = [
 class Config:
     # ---- where things live (all inside the project folder) ----------------
     data_root: Path = PROJECT_DIR / "data"
-    output_dir: Path = PROJECT_DIR / "model"   # trained model is stored here
+    output_dir: Path = PROJECT_DIR / "medsynth-model"   # trained model is stored here
     base_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 
     # ---- behaviour --------------------------------------------------------
@@ -774,12 +774,79 @@ def _resolve_mixed_precision(choice: str) -> str:
 
 def _latest_state(out_dir: Path):
     found = []
-    for path in (out_dir / "state").glob("step-*"):
-        try:
-            found.append((int(path.name.split("-")[1]), path))
-        except (IndexError, ValueError):
+    search_dirs = [
+        out_dir / "state",
+        out_dir / "checkpoints",
+        PROJECT_DIR / "model" / "checkpoints",
+        PROJECT_DIR / "model" / "state",
+        PROJECT_DIR / "model",
+    ]
+    for s_dir in search_dirs:
+        if not s_dir.is_dir():
             continue
-    return max(found) if found else None
+        for path in s_dir.iterdir():
+            if not path.is_dir():
+                continue
+            name = path.name
+            step_num = None
+            if name.startswith("lora-step-"):
+                try:
+                    step_num = int(name.replace("lora-step-", ""))
+                except ValueError:
+                    pass
+            elif name.startswith("step-"):
+                try:
+                    step_num = int(name.replace("step-", ""))
+                except ValueError:
+                    pass
+            if step_num is not None:
+                is_full_state = (path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists()
+                found.append((step_num, 1 if is_full_state else 0, path))
+    
+    if not found:
+        return None
+    found.sort(key=lambda x: (x[0], x[1]))
+    best_step, _, best_path = found[-1]
+    return (best_step, best_path)
+
+
+def _ensure_lora_weights(out_dir: Path, step: int = 0) -> None:
+    lora_target = out_dir / "lora"
+    lora_target.mkdir(parents=True, exist_ok=True)
+    if (lora_target / "pytorch_lora_weights.safetensors").exists():
+        return
+
+    search_paths = []
+    if step > 0:
+        search_paths.append(out_dir / "checkpoints" / f"lora-step-{step}")
+        search_paths.append(PROJECT_DIR / "model" / "checkpoints" / f"lora-step-{step}")
+
+    search_paths.extend([
+        PROJECT_DIR / "model" / "lora",
+        PROJECT_DIR / "model" / "checkpoints",
+        out_dir / "checkpoints",
+    ])
+
+    for base in [PROJECT_DIR / "model" / "checkpoints", out_dir / "checkpoints"]:
+        if base.is_dir():
+            for p in sorted(
+                base.glob("lora-step-*"),
+                key=lambda x: int(x.name.split("-")[-1]) if x.name.split("-")[-1].isdigit() else 0,
+                reverse=True,
+            ):
+                search_paths.append(p)
+
+    for cand in search_paths:
+        if cand.is_file() and cand.name == "pytorch_lora_weights.safetensors":
+            src = cand
+        elif cand.is_dir() and (cand / "pytorch_lora_weights.safetensors").exists():
+            src = cand / "pytorch_lora_weights.safetensors"
+        else:
+            continue
+
+        shutil.copy(src, lora_target / "pytorch_lora_weights.safetensors")
+        print(f"Copied trained LoRA weights from {src} to {lora_target}")
+        return
 
 
 def train(cfg: Config) -> None:
@@ -956,12 +1023,17 @@ def train(cfg: Config) -> None:
     # ---- automatic resume ----------------------------------------------
     global_step, first_epoch, resume_batches = 0, 0, 0
     latest = _latest_state(out_dir)
+    did_train = False
     if latest is not None:
         global_step, path = latest
-        accelerator.load_state(str(path))
-        first_epoch = global_step // steps_per_epoch
-        resume_batches = (global_step - first_epoch * steps_per_epoch) * cfg.grad_accum
-        print(f"Resuming from {path.name} (step {global_step} of {cfg.max_train_steps})")
+        if global_step < cfg.max_train_steps:
+            if (path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists():
+                accelerator.load_state(str(path))
+            first_epoch = global_step // steps_per_epoch
+            resume_batches = (global_step - first_epoch * steps_per_epoch) * cfg.grad_accum
+            print(f"Resuming from {path.name} (step {global_step} of {cfg.max_train_steps})")
+        else:
+            print(f"Found completed model/checkpoint at step {global_step} in {path}")
 
     (out_dir / "train_config.json").write_text(
         json.dumps({"config": asdict(cfg), "datasets": {k: asdict(v) for k, v in DATASETS.items()},
@@ -975,6 +1047,7 @@ def train(cfg: Config) -> None:
     # ---- training loop --------------------------------------------------
     prediction_type = noise_scheduler.config.prediction_type
     if global_step < cfg.max_train_steps:
+        did_train = True
         progress = tqdm(total=cfg.max_train_steps, initial=global_step, desc="training")
         unet.train()
         running_loss, running_n = 0.0, 0
@@ -1056,7 +1129,11 @@ def train(cfg: Config) -> None:
     else:
         print(f"Training already reached {global_step} steps, skipping to export.")
 
-    save_lora(out_dir / "lora")
+    if did_train:
+        save_lora(out_dir / "lora")
+    else:
+        _ensure_lora_weights(out_dir, global_step)
+
     log_samples(global_step)
     print(f"\nTraining finished at step {global_step}. LoRA saved to {out_dir / 'lora'}")
     accelerator.end_training()
@@ -1074,6 +1151,9 @@ def export_pipeline(cfg: Config) -> Path:
 
     out_dir = Path(cfg.output_dir)
     lora_dir = out_dir / "lora"
+    if not (lora_dir / "pytorch_lora_weights.safetensors").exists():
+        _ensure_lora_weights(out_dir)
+
     if not (lora_dir / "pytorch_lora_weights.safetensors").exists():
         sys.exit(f"No pytorch_lora_weights.safetensors in {lora_dir}. Training did not finish.")
 

@@ -31,7 +31,8 @@ medsynth/
 ├── main.py
 ├── train.py                  <- everything is configured at the top of this file
 ├── requirements.txt
-├── utils/chat_history.py
+├── utils/prompt_enhancer.py  <- free text -> caption in the training grammar (75-token budget)
+├── utils/chat_history.py     <- conversations, images and per-thread settings (SQLite)
 ├── data/                     <- your datasets
 │   └── raw/ham10000  raw/pad_ufes_20  raw/fitzpatrick17k
 └── medsynth-model/           <- created by train.py: your trained model
@@ -90,14 +91,13 @@ its community mirror `stable-diffusion-v1-5/stable-diffusion-v1-5`.
 python train.py
 ```
 
-It runs these steps in order and skips whatever is already done:
-
-1. checks for CUDA (fails fast if missing)
-2. tidies loose dataset files into `data/raw/<dataset>/`
-3. downloads the Fitzpatrick17k images
-4. builds captions, caps large classes, resizes everything to 512×512, holds out 2 % for evaluation
-5. trains the LoRA on the GPU
-6. merges it into a standalone model at `medsynth-model/pipeline/` and marks the run complete
+It runs these steps in order, skipping any that are already complete:
+1️⃣ Verify CUDA availability.
+2️⃣ Organise loose files into `data/raw/<dataset>/`.
+3️⃣ Download the Fitzpatrick17k images.
+4️⃣ Build captions, cap class sizes, and resize every image to 512 × 512 (2 % held‑out for evaluation).
+5️⃣ Train the LoRA on the GPU.
+6️⃣ **Export** a standalone pipeline into `medsynth-model/pipeline/` and write a completion marker.
 
 **Stopped or crashed?** Just run `python train.py` again. It resumes from the newest
 checkpoint (saved every 1,000 steps). **Already finished?** Running it again prints where the
@@ -180,9 +180,48 @@ basal cell carcinoma, malignant, face, Fitzpatrick skin type 2
 psoriasis, non-neoplastic, Fitzpatrick skin type 5
 ```
 
+Free text works too — enhancement maps what you wrote onto that grammar:
+
+```
+a mole on the left arm of a fitzpatrick 3 patient   ->  smartphone photo of melanocytic nevus,
+                                                         benign, arm, Fitzpatrick skin type 3, …
+irregular lesion, pigment network, upper extremity  ->  dermoscopy image of … , upper extremity, …
+```
+
+Expand **How the prompt is built** under the composer to see the exact caption that will be sent,
+the token count, and which parts were recognised.
+
 `medsynth-model/prompt_examples.txt` lists one example caption per class (HAM10000 has 7,
 PAD-UFES-20 has 7, Fitzpatrick17k has 114). Use the skin-type phrase (1 to 6) to steer skin
 tone. Good settings: 30 steps, guidance 6 to 8.
+
+### Clinical prompt enhancement
+The fine-tune only ever saw short captions shaped
+`<view> of <diagnosis>, <category>, <body site>, <Fitzpatrick type>`. Enhancement keeps you
+inside that distribution instead of layering prose on top of it. It:
+
+1. picks the caption prefix for the view you selected,
+2. normalises your wording onto the dataset vocabulary (`bcc` → `basal cell carcinoma`,
+   `left arm` → `arm`, `fitzpatrick 3` → `Fitzpatrick skin type 3`),
+3. infers what you left out — a matched diagnosis supplies its category,
+4. appends the imaging terms that view needs (`10x magnification`, `polarized illumination`,
+   …) while budget allows.
+
+Turn it off to send your text verbatim. Either way the caption is capped at **75 CLIP tokens**,
+which is what keeps the tokenizer from rejecting long prompts.
+
+### Conversations
+Every thread is stored in `results/medsynth_history.sqlite3` together with its images.
+
+- **New conversation** starts a fresh thread; the sidebar lists all of them with message and
+  image counts and a relative timestamp.
+- **Search** filters by title *and* by anything said inside a thread.
+- **Clear chat** empties a thread but keeps it; **Delete conversation** needs two clicks so a
+  mis-click cannot lose history.
+- Generation settings (view, steps, guidance, seed, negative prompt) are saved **per
+  conversation** — switching threads restores the setup that thread was last used with.
+- **Shuffle** rolls a new seed, and every generated image records the seed that produced it, so
+  a good result can be reproduced by pasting that number back into the seed field.
 
 ### Using the model in other projects
 
