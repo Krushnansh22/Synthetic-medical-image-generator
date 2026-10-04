@@ -223,15 +223,20 @@ def _last_prompt(conversation_id):
 def _conversation_choices(query=""):
     # Two-line labels: the title on the first line, activity + time on the
     # second. The CSS uses `white-space: pre-line` so the newline is honoured.
-    return [
-        (
-            f"{_short_title(conversation['title'])}\n"
-            f"{_activity_label(conversation)} · "
-            f"{_relative_stamp(conversation['updated_at'])}",
-            conversation["id"],
+    # Pinned threads sort to the top and carry a leading dot so the pin is
+    # still obvious. Radio labels are plain text, so it must be a glyph.
+    choices = []
+    for conversation in chat_history.list_conversations(query):
+        marker = "● " if conversation["pinned"] else ""
+        choices.append(
+            (
+                f"{marker}{_short_title(conversation['title'])}\n"
+                f"{_activity_label(conversation)} · "
+                f"{_relative_stamp(conversation['updated_at'])}",
+                conversation["id"],
+            )
         )
-        for conversation in chat_history.list_conversations(query)
-    ]
+    return choices
 
 
 # ---------------------------------------------------------------------------
@@ -368,24 +373,24 @@ def _chip(label, value, tone=""):
 
 
 def _context_html(prompt, image_type, clinical, steps, guidance, seed):
-    """The strip above the composer: active settings + a live token meter."""
+    """The single meta row that sits directly above the chat.
+
+    Left: the conversation's category and the settings that shape the next
+    generation. Right: the live CLIP token count for the prompt being typed,
+    pinned to the edge so it never drifts as chips wrap.
+    """
     plan = prompt_enhancer.build_plan(prompt, clinical, image_type)
 
-    meter_tone = (
-        "warn" if plan.truncated or plan.tokens >= plan.limit - 5 else ""
-    )
+    near_limit = plan.tokens >= plan.limit - 5
+    meter_tone = "warn" if plan.truncated or near_limit else ""
     meter_class = f"ms-meter ms-meter--{meter_tone}" if meter_tone else "ms-meter"
 
     chips = [
-        _chip("view", image_type),
+        _chip("category", image_type, "on"),
         _chip("steps", int(steps)),
         _chip("cfg", f"{float(guidance):g}"),
         _chip("seed", "random" if seed is None or int(seed) < 0 else int(seed)),
-        _chip(
-            "clinical",
-            "on" if clinical else "off",
-            "on" if clinical else "off",
-        ),
+        _chip("clinical", "on" if clinical else "off", "on" if clinical else "off"),
     ]
 
     fill = round(plan.usage * 100)
@@ -394,7 +399,10 @@ def _context_html(prompt, image_type, clinical, steps, guidance, seed):
         f'aria-label="Prompt uses {plan.tokens} of {plan.limit} CLIP tokens">'
         f'<span class="ms-meter__track">'
         f'<span class="ms-meter__fill" style="width:{fill}%"></span></span>'
-        f'<span class="ms-meter__text">{plan.tokens}/{plan.limit} tokens</span>'
+        f'<span class="ms-meter__text">'
+        f'<b>{plan.tokens}</b><span class="ms-meter__sep">/</span>'
+        f'<span class="ms-meter__limit">{plan.limit}</span>'
+        f'<span class="ms-meter__unit">tokens</span></span>'
         "</div>"
     )
 
@@ -417,11 +425,13 @@ def _context_html(prompt, image_type, clinical, steps, guidance, seed):
         breakdown = f'<ul class="ms-note">{rows}</ul>'
 
     return (
-        f'<div class="ms-context">'
+        f'<div class="ms-meta">'
+        f'<div class="ms-meta__left">'
         f'<div class="ms-chips">{"".join(chips)}</div>'
-        f"{meter}"
-        f'<details class="ms-details"><summary>How the prompt is built</summary>'
+        f'<details class="ms-details"><summary>Prompt</summary>'
         f"{breakdown}</details>"
+        f"</div>"
+        f'<div class="ms-meta__right">{meter}</div>'
         f"</div>"
     )
 
@@ -466,6 +476,42 @@ def randomize_seed():
 # ---------------------------------------------------------------------------
 # Conversation actions
 # ---------------------------------------------------------------------------
+#
+# Every action that can change which conversation is open returns the same
+# tuple, in the order of CONVERSATION_OUTPUTS (declared with the UI below).
+# Routing all of them through one refresh function means the sidebar, the
+# transcript, the settings and the meta bar can never drift out of sync with
+# each other, and adding an output only means editing one place.
+
+UNARMED = gr.update(value="Delete conversation", elem_classes=[])
+
+
+def _refresh(conversation_id, query="", *, transcript=None, prompt="",
+             search=""):
+    """The canonical update for `conversation_id`, ready to be returned."""
+    history_update, empty_html, selected_id = _history_sidebar(
+        conversation_id, query,
+    )
+    updates = _settings_updates(chat_history.get_settings(selected_id))
+    conversation = chat_history.get_conversation(selected_id) or {}
+    pinned = bool(conversation.get("pinned"))
+
+    return (
+        _render_conversation(selected_id) if transcript is None else transcript,
+        selected_id,
+        history_update,
+        empty_html,
+        *updates,
+        sync_context(prompt or _last_prompt(selected_id), *updates[:5]),
+        UNARMED,
+        None,
+        search,
+        gr.update(value="Unpin" if pinned else "Pin",
+                  elem_classes=["ms-btn--on"] if pinned else []),
+        conversation.get("title") or "",
+        "",
+    )
+
 
 def start_conversation(query=""):
     """Create a thread and clear the search filter so it is actually visible.
@@ -483,63 +529,79 @@ def start_conversation(query=""):
             "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
         }
     )
-    history_update, empty_html, _ = _history_sidebar(conversation_id)
-    updates = _settings_updates(chat_history.get_settings(conversation_id))
-    return (
-        [],
-        conversation_id,
-        history_update,
-        empty_html,
-        *updates,
-        sync_context("", *updates[:5]),
-        gr.update(value="Delete conversation", elem_classes=[]),
-        None,
-        "",
-    )
+    # Several abandoned clicks in a row should not leave a column of empty
+    # threads behind; the newest one always survives.
+    chat_history.prune_empty_conversations()
+    return _refresh(conversation_id, query="", transcript=[], prompt="")
 
 
 def select_conversation(conversation_id, query=""):
-    settings = chat_history.get_settings(conversation_id)
-    updates = _settings_updates(settings)
-    return (
-        _render_conversation(conversation_id),
-        conversation_id,
-        *_settings_updates(settings),
-        sync_context(_last_prompt(conversation_id), *updates[:5]),
-        gr.update(value="Delete conversation", elem_classes=[]),
-        None,
-    )
+    return _refresh(conversation_id, query)
 
 
 def remove_conversation(conversation_id, query=""):
     chat_history.delete_conversation(conversation_id)
     if not chat_history.list_conversations():
         chat_history.create_conversation()
-
-    history_update, empty_html, selected_id = _history_sidebar(None, query)
-    settings = chat_history.get_settings(selected_id)
-    updates = _settings_updates(settings)
-    return (
-        _render_conversation(selected_id),
-        selected_id,
-        history_update,
-        empty_html,
-        *updates,
-        sync_context(_last_prompt(selected_id), *updates[:5]),
-        gr.update(value="Delete conversation", elem_classes=[]),
-    )
+    return _refresh(None, query)
 
 
 def clear_conversation(conversation_id, query=""):
     """Empty the thread but keep it - and its settings - in the sidebar."""
     chat_history.clear_messages(conversation_id)
-    history_update, empty_html, _ = _history_sidebar(conversation_id, query)
-    return [], history_update, empty_html, None
+    chat_history.rename_conversation(conversation_id, "New conversation")
+    return _refresh(conversation_id, query, transcript=[])
 
 
 def filter_history(query, conversation_id):
-    history_update, empty_html, selected_id = _history_sidebar(conversation_id, query)
+    history_update, empty_html, selected_id = _history_sidebar(
+        conversation_id, query,
+    )
     return history_update, empty_html, selected_id
+
+
+def rename_conversation_from_ui(conversation_id, title):
+    """Save a user-supplied name, or clear the field when it was left empty."""
+    conversation_id = conversation_id or chat_history.create_conversation()
+    title = (title or "").strip()
+    if title:
+        chat_history.rename_conversation(conversation_id, title)
+    else:
+        conversation = chat_history.get_conversation(conversation_id)
+        title = (conversation or {}).get("title") or ""
+
+    update, empty_html, selected_id = _history_sidebar(conversation_id)
+    return update, empty_html, gr.update(value=title)
+
+
+def toggle_pin(conversation_id, query=""):
+    """Pin or unpin, then keep the thread selected and in view."""
+    chat_history.set_pinned(conversation_id)
+    return _refresh(conversation_id, query, transcript=gr.skip())
+
+
+def duplicate_conversation(conversation_id, query=""):
+    """Branch a copy of this thread and open it."""
+    new_id = chat_history.duplicate_conversation(conversation_id)
+    if new_id is None:
+        return _refresh(conversation_id, query, transcript=gr.skip())
+    return _refresh(new_id, query="")
+
+
+def export_conversation(conversation_id):
+    """Write the thread to results/exports and say where it landed."""
+    path = chat_history.export_conversation(conversation_id)
+    if path is None:
+        return (
+            '<div class="ms-note-box ms-note-box--error">Nothing to export.'
+            "</div>"
+        )
+    folder = path.parent
+    return (
+        f'<div class="ms-note-box ms-note-box--ok">'
+        f"Exported to <code>{html.escape(str(folder))}</code>"
+        "</div>"
+    )
 
 
 def arm_delete(conversation_id, pending_id):
@@ -548,16 +610,18 @@ def arm_delete(conversation_id, pending_id):
     Gradio requires one return value per declared output, so the arming branch
     pads with `gr.skip()` to leave the transcript and settings untouched.
     """
+    skip = [gr.skip()] * 16
+
     if not conversation_id:
         return (
-            *([gr.skip()] * 11),
+            *skip,
             gr.update(value="Nothing to delete", elem_classes=["ms-btn--armed"]),
             None,
         )
 
     if pending_id != conversation_id:
         return (
-            *([gr.skip()] * 11),
+            *skip,
             gr.update(value="Confirm delete", elem_classes=["ms-btn--armed"]),
             conversation_id,
         )
@@ -727,6 +791,9 @@ initial_settings = chat_history.get_settings(initial_conversation_id)
 if not initial_settings["negative_prompt"]:
     initial_settings["negative_prompt"] = DEFAULT_NEGATIVE_PROMPT
 initial_updates = _settings_updates(initial_settings)
+initial_conversation = chat_history.get_conversation(initial_conversation_id) or {}
+initial_title = initial_conversation.get("title") or ""
+initial_pinned = bool(initial_conversation.get("pinned"))
 
 
 _model_state: dict[str, str] = {"state": "loading", "detail": ""}
@@ -782,6 +849,248 @@ HEAD_HTML = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap">
+<script>
+/* Progressive enhancement only: every behaviour below has a working fallback
+   if this script never runs. Kept dependency-free and idempotent so Gradio's
+   DOM swaps do not leave duplicate listeners behind. */
+(function () {
+  "use strict";
+
+  const VIEW = "#conversation-view";
+  const PROMPT = "#prompt-box textarea";
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const scroller = () => document.querySelector(VIEW + " .wrap");
+  let promptPanelOpen = false;
+
+  /* ---------- auto-growing composer ---------- */
+  function autosize(textarea) {
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = textarea.scrollHeight + "px";
+  }
+
+  /* ---------- keep the transcript pinned to the newest message ---------- */
+  function stickToBottom(behavior) {
+    const view = scroller();
+    if (!view) return;
+    view.scrollTo({
+      top: view.scrollHeight,
+      behavior: behavior || (reduced.matches ? "auto" : "smooth"),
+    });
+  }
+
+  /* The jump-to-latest button only earns its place when the reader has
+     scrolled away from the bottom. */
+  function syncJumpButton() {
+    const view = scroller();
+    const button = document.querySelector("#scroll-controls .ms-jump");
+    if (!view || !button) return;
+    const distance = view.scrollHeight - view.scrollTop - view.clientHeight;
+    const show = view.scrollHeight > view.clientHeight + 40 && distance > 80;
+    button.hidden = !show;
+    button.classList.toggle("is-visible", show);
+  }
+
+  /* ---------- image lightbox ---------- */
+  function openLightbox(source) {
+    const overlay = document.createElement("div");
+    overlay.className = "ms-lightbox";
+    overlay.innerHTML =
+      '<img alt=""><button class="ms-lightbox__close" type="button" ' +
+      'aria-label="Close">&times;</button>' +
+      '<span class="ms-lightbox__caption"></span>';
+    const image = overlay.querySelector("img");
+    image.src = source.currentSrc || source.src;
+    image.alt = source.alt || "Generated image";
+
+    const caption = message && message.previousElementSibling;
+    const meta = caption && caption.querySelector(".ms-cap");
+overlay.querySelector(".ms-lightbox__caption").textContent =
+      meta ? meta.textContent.replace(/\s+/g, " ").trim() : image.alt;
+
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") close();
+    };
+
+    overlay.addEventListener("click", close);
+    overlay.querySelector(".ms-lightbox__close").addEventListener(
+      "click", (event) => { event.stopPropagation(); close(); },
+    );
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add("is-open"));
+  }
+
+  /* ---------- keyboard shortcuts ---------- */
+  const shortcuts = {
+    k: "#new-chat",
+    "\\/": "#settings-accordion summary",
+    f: "#history-search input",
+  };
+
+  function focus(selector) {
+    const node = document.querySelector(selector);
+    if (!node) return false;
+    node.focus();
+    if (typeof node.click === "function" && node.tagName === "SUMMARY") {
+      node.click();
+    }
+    return true;
+  }
+
+  function isTyping(target) {
+    if (!target) return false;
+    const tag = target.tagName;
+    return tag === "TEXTAREA" || tag === "INPUT" || target.isContentEditable;
+  }
+
+  function onKeydown(event) {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+
+    const key = event.key.toLowerCase();
+    if (key === "enter") {                       // Ctrl+Enter re-sends
+      const prompt = document.querySelector(PROMPT);
+      if (prompt && prompt.value.trim()) {
+        event.preventDefault();
+        prompt.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+        );
+      }
+      return;
+    }
+
+    const selector = shortcuts[key];
+    // Inside a text field the browser's own bindings win, except Ctrl+Enter.
+    if (!selector || (isTyping(event.target) && key !== "enter")) return;
+    if (focus(selector)) event.preventDefault();
+  }
+
+  /* ---------- hover actions on messages ---------- */
+  function decorateMessages() {
+    document.querySelectorAll(VIEW + " .message-row").forEach((row) => {
+      const message = row.querySelector(".message");
+      if (!message || row.querySelector(".ms-copy")) return;
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ms-copy";
+      button.textContent = "Copy";
+      button.setAttribute("aria-label", "Copy message text");
+      button.addEventListener("click", async () => {
+        const text = (message.innerText || "").trim();
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch (error) {
+          const area = document.createElement("textarea");
+          area.value = text;
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand("copy");
+          area.remove();
+        }
+        button.textContent = "Copied";
+        button.classList.add("is-done");
+        setTimeout(() => {
+          button.textContent = "Copy";
+          button.classList.remove("is-done");
+        }, 1400);
+      });
+      row.appendChild(button);
+    });
+
+    document.querySelectorAll(VIEW + " img").forEach((image) => {
+      if (image.dataset.msZoom === "on") return;
+      image.dataset.msZoom = "on";
+      image.classList.add("ms-zoomable");
+      image.addEventListener("click", () => openLightbox(image));
+    });
+  }
+
+  /* ---------- keep the prompt panel open while typing ----------
+     The meta row is re-rendered on every keystroke to move the token count,
+     which would slam the "Prompt" panel shut under the cursor. Remember the
+     reader's choice and restore it after each swap. */
+  function keepPromptPanelOpen() {
+    const bar = document.querySelector("#meta-bar");
+    if (!bar) return;
+
+    const details = bar.querySelector("details");
+    if (details && details.open !== promptPanelOpen) {
+      details.open = promptPanelOpen;
+    }
+
+    new MutationObserver(() => {
+      const next = bar.querySelector("details");
+      if (next && next.open !== promptPanelOpen) {
+        next.open = promptPanelOpen;
+      }
+    }).observe(bar, { childList: true, subtree: true });
+
+    // `toggle` does not bubble, so listen during the capture phase.
+    bar.addEventListener("toggle", (event) => {
+      if (event.target.tagName === "DETAILS") {
+        promptPanelOpen = event.target.open;
+      }
+    }, true);
+  }
+
+  /* ---------- wiring ---------- */
+  function boot() {
+    const prompt = document.querySelector(PROMPT);
+    if (prompt) {
+      autosize(prompt);
+      prompt.addEventListener("input", () => autosize(prompt));
+      // Enter sends, Shift+Enter makes a line break.
+      prompt.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          prompt.form && prompt.form.requestSubmit
+            ? prompt.form.requestSubmit()
+            : prompt.blur();
+        }
+      });
+      // Start the caret in the composer instead of the page.
+      if (!window.matchMedia("(max-width: 900px)").matches) {
+        prompt.focus({ preventScroll: true });
+      }
+    }
+
+    const view = scroller();
+    if (view) {
+      view.addEventListener("scroll", syncJumpButton, { passive: true });
+      stickToBottom("auto");
+    }
+
+    const jump = document.querySelector("#scroll-controls .ms-jump");
+    if (jump) {
+      jump.addEventListener("click", () => stickToBottom());
+    }
+
+    decorateMessages();
+    syncJumpButton();
+    keepPromptPanelOpen();
+  }
+
+  // Gradio swaps innerHTML on updates; a mutation observer keeps our
+  // decorations and scroll position correct without re-binding everything.
+  const panel = document.querySelector("#conversation-view");
+  if (panel) {
+    new MutationObserver(() => {
+      decorateMessages();
+      syncJumpButton();
+      stickToBottom();
+    }).observe(panel, { childList: true, subtree: true });
+  }
+
+  document.addEventListener("keydown", onKeydown);
+  document.addEventListener("DOMContentLoaded", boot);
+  if (document.readyState !== "loading") boot();
+})();
+</script>
 """
 
 APP_CSS = """
@@ -1506,18 +1815,43 @@ gradio-app { display: block; width: 100%; }
 /* ===== 6. Composer ====================================================== */
 #composer { flex: 0 0 auto; display: flex !important; flex-direction: column; gap: 8px !important; }
 
-/* context strip: active settings chips + live token meter + prompt preview */
-.ms-context {
-    display: flex;
+/* the transcript grows to fill whatever the meta row leaves behind */
+#scroll-anchor {
+    position: relative;
+    flex: 1 1 0 !important;
+    min-height: 0 !important;
+    display: flex !important;
     flex-direction: column;
-    gap: 8px;
-    padding: 11px 13px;
+}
+
+/* ===== 6a. Meta row: category + settings left, token count right ======== */
+#meta-bar { flex: 0 0 auto; }
+.ms-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px 18px;
+    padding: 8px 14px;
     border: 1px solid var(--ms-line);
     border-radius: var(--ms-r-md);
     background: var(--ms-surface);
     box-shadow: var(--ms-shadow-sm);
 }
-.ms-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ms-meta__left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.ms-meta__right {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+}
+
+.ms-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .ms-chip {
     display: inline-flex;
     align-items: baseline;
@@ -1529,6 +1863,7 @@ gradio-app { display: block; width: 100%; }
     font-size: 11.5px;
     line-height: 1.5;
     white-space: nowrap;
+    transition: border-color .2s, background-color .2s, color .2s;
 }
 .ms-chip__key { color: var(--ms-muted); text-transform: uppercase; letter-spacing: .06em; font-size: 10px; }
 .ms-chip__val { color: var(--ms-text); font-weight: 600; }
@@ -1539,9 +1874,10 @@ gradio-app { display: block; width: 100%; }
 .ms-chip--on .ms-chip__val { color: var(--ms-accent); }
 .ms-chip--off { opacity: .72; }
 
-.ms-meter { display: flex; align-items: center; gap: 9px; }
+/* token meter: the count is the anchor, pinned right of the row */
+.ms-meter { display: flex; align-items: center; gap: 10px; }
 .ms-meter__track {
-    flex: 1 1 auto;
+    flex: 0 0 clamp(48px, 9vw, 96px);
     height: 5px;
     border-radius: 999px;
     background: var(--ms-surface-2);
@@ -1553,29 +1889,44 @@ gradio-app { display: block; width: 100%; }
     height: 100%;
     border-radius: 999px;
     background: var(--ms-accent);
-    transition: width .28s var(--ms-ease), background-color .2s;
+    transition: width .3s var(--ms-ease), background-color .2s;
 }
 .ms-meter--warn .ms-meter__fill { background: var(--ms-warn); }
 .ms-meter__text {
     flex: 0 0 auto;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     color: var(--ms-muted);
+    white-space: nowrap;
 }
-.ms-meter--warn .ms-meter__text { color: var(--ms-warn); font-weight: 600; }
+.ms-meter__text b { font-size: 12.5px; font-weight: 700; color: var(--ms-text); }
+.ms-meter--warn .ms-meter__text b { color: var(--ms-warn); }
+.ms-meter__sep { opacity: .5; }
+.ms-meter__limit { opacity: .75; }
+.ms-meter__unit { margin-left: 4px; font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
 
+/* the breakdown floats over the chat instead of stretching the meta row */
+.ms-details { position: relative; flex: 0 0 auto; }
 .ms-details > summary {
     cursor: pointer;
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: .04em;
+    letter-spacing: .05em;
     text-transform: uppercase;
     color: var(--ms-muted);
     list-style: none;
     display: flex;
     align-items: center;
-    gap: 6px;
-    transition: color .18s;
+    gap: 5px;
+    padding: 3px 9px;
+    border: 1px solid var(--ms-line);
+    border-radius: 999px;
+    background: var(--ms-surface-2);
+    white-space: nowrap;
+    transition: color .18s, border-color .18s, background-color .18s;
 }
 .ms-details > summary::-webkit-details-marker { display: none; }
 .ms-details > summary::before {
@@ -1586,15 +1937,33 @@ gradio-app { display: block; width: 100%; }
     transition: transform .2s var(--ms-ease);
 }
 .ms-details[open] > summary::before { transform: rotate(90deg); }
+.ms-details[open] > summary {
+    color: var(--ms-accent);
+    border-color: rgb(var(--ms-accent-rgb) / .4);
+    background: rgb(var(--ms-accent-rgb) / .1);
+}
 .ms-details > summary:hover { color: var(--ms-text); }
-.ms-details > summary:focus-visible { outline: 2px solid var(--ms-accent); outline-offset: 3px; border-radius: 4px; }
+.ms-details > summary:focus-visible { outline: 2px solid var(--ms-accent); outline-offset: 3px; }
+/* the breakdown floats over the chat instead of stretching the meta row */
+.ms-details > .ms-note {
+    position: absolute;
+    z-index: 40;
+    top: calc(100% + 8px);
+    left: 0;
+    width: min(420px, 74vw);
+    margin: 0;
+    padding: 11px 13px;
+    border: 1px solid var(--ms-line);
+    border-radius: var(--ms-r-sm);
+    background: var(--ms-surface);
+    box-shadow: var(--ms-shadow);
+    animation: ms-drop .18s var(--ms-ease) both;
+}
 .ms-note {
-    margin: 8px 0 0;
-    padding: 0;
-    list-style: none;
     display: flex;
     flex-direction: column;
     gap: 6px;
+    list-style: none;
     font-size: 12px;
     line-height: 1.5;
     color: var(--ms-muted);
@@ -1626,11 +1995,13 @@ gradio-app { display: block; width: 100%; }
     box-shadow: 0 0 0 4px rgb(var(--ms-accent-rgb) / .16), var(--ms-shadow);
 }
 #prompt-box textarea {
-    min-height: 56px !important;
+    min-height: 52px !important;
+    max-height: 168px !important;
     padding: 15px 18px 6px !important;
     border: 0 !important;
     background: transparent !important;
     box-shadow: none !important;
+    overflow-y: auto;
     font-size: 15px;
     line-height: 1.5;
 }
@@ -1650,6 +2021,165 @@ gradio-app { display: block; width: 100%; }
 }
 #prompt-box .submit-button:active:not(:disabled) { transform: scale(.97); }
 
+/* ===== 6b. Jump to latest ============================================== */
+#scroll-controls { position: absolute; z-index: 20; right: 18px; bottom: 14px; pointer-events: none; }
+#scroll-controls:empty { display: none; }
+.ms-jump {
+    pointer-events: auto;
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid var(--ms-line);
+    border-radius: 50%;
+    background: var(--ms-surface);
+    color: var(--ms-text);
+    box-shadow: var(--ms-shadow);
+    cursor: pointer;
+    opacity: 0;
+    transform: translateY(8px) scale(.9);
+    transition: opacity .22s var(--ms-ease), transform .22s var(--ms-ease),
+                border-color .18s, box-shadow .18s;
+}
+.ms-jump.is-visible { opacity: 1; transform: none; }
+.ms-jump:hover {
+    border-color: var(--ms-accent);
+    color: var(--ms-accent);
+    box-shadow: 0 8px 20px -10px rgb(var(--ms-accent-rgb) / .8);
+}
+.ms-jump:hover .ms-jump__arrow { animation: ms-bob .5s var(--ms-ease) infinite alternate; }
+.ms-jump__arrow {
+    width: 0; height: 0;
+    border: 5px solid transparent;
+    border-top-color: currentColor;
+    margin-top: 3px;
+}
+
+/* ===== 6c. Message hover actions ======================================= */
+#conversation-view .message-row { position: relative; }
+.ms-copy {
+    position: absolute;
+    top: 6px;
+    right: 10px;
+    z-index: 5;
+    padding: 3px 9px;
+    border: 1px solid var(--ms-line);
+    border-radius: 999px;
+    background: var(--ms-surface);
+    color: var(--ms-muted);
+    font: 500 11px/1.4 var(--font);
+    cursor: pointer;
+    opacity: 0;
+    transform: translateY(-3px);
+    transition: opacity .18s, transform .18s var(--ms-ease),
+                color .18s, border-color .18s, background-color .18s;
+}
+#conversation-view .user-row .ms-copy { right: auto; left: 10px; }
+#conversation-view .message-row:hover .ms-copy,
+.ms-copy:focus-visible { opacity: 1; transform: none; }
+.ms-copy:hover {
+    color: var(--ms-accent);
+    border-color: rgb(var(--ms-accent-rgb) / .45);
+    background: rgb(var(--ms-accent-rgb) / .08);
+}
+.ms-copy.is-done {
+    color: var(--ms-accent);
+    border-color: rgb(var(--ms-accent-rgb) / .5);
+    background: rgb(var(--ms-accent-rgb) / .14);
+}
+
+/* click a generated image to inspect it full-size */
+#conversation-view img.ms-zoomable {
+    cursor: zoom-in;
+    transition: transform .22s var(--ms-ease), box-shadow .22s var(--ms-ease);
+}
+#conversation-view img.ms-zoomable:hover {
+    transform: scale(1.012);
+    box-shadow: var(--ms-shadow);
+}
+
+.ms-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: clamp(20px, 5vw, 56px);
+    background: rgb(6 14 12 / .82);
+    backdrop-filter: blur(6px);
+    opacity: 0;
+    transition: opacity .22s var(--ms-ease);
+}
+.ms-lightbox.is-open { opacity: 1; }
+.ms-lightbox img {
+    max-width: 100%;
+    max-height: 82vh;
+    border-radius: var(--ms-r-md);
+    box-shadow: 0 30px 80px -30px rgb(0 0 0 / .8);
+    transform: scale(.97);
+    transition: transform .26s var(--ms-ease);
+}
+.ms-lightbox.is-open img { transform: none; }
+.ms-lightbox__caption {
+    max-width: 640px;
+    font-size: 12.5px;
+    line-height: 1.55;
+    text-align: center;
+    color: rgb(255 255 255 / .74);
+}
+.ms-lightbox__close {
+    position: absolute;
+    top: 16px;
+    right: 20px;
+    width: 38px;
+    height: 38px;
+    border: 1px solid rgb(255 255 255 / .2);
+    border-radius: 50%;
+    background: rgb(255 255 255 / .1);
+    color: #fff;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background-color .18s, transform .18s var(--ms-ease);
+}
+.ms-lightbox__close:hover { background: rgb(255 255 255 / .2); transform: rotate(90deg); }
+
+/* ===== 6d. Sidebar management controls ================================ */
+#manage-row { gap: 8px !important; }
+#manage-row button { min-height: 36px !important; font-size: 12.5px !important; }
+#pin-chat.ms-btn--on {
+    color: var(--ms-accent) !important;
+    border-color: rgb(var(--ms-accent-rgb) / .5) !important;
+    background: rgb(var(--ms-accent-rgb) / .12) !important;
+}
+#rename-title input {
+    font-size: 12.5px !important;
+    padding-top: 7px !important;
+    padding-bottom: 7px !important;
+}
+#rename-title { transition: opacity .2s; }
+#export-chat { min-height: 36px !important; font-size: 12.5px !important; }
+#export-note:empty { display: none; }
+.ms-note-box--ok {
+    border-color: rgb(var(--ms-accent-rgb) / .4) !important;
+    background: rgb(var(--ms-accent-rgb) / .08) !important;
+    color: var(--ms-text) !important;
+    animation: ms-settle .24s var(--ms-ease) both;
+}
+.ms-note-box--error {
+    border-color: rgb(var(--ms-danger-rgb) / .4) !important;
+    background: rgb(var(--ms-danger-rgb) / .08) !important;
+    color: var(--ms-danger) !important;
+    animation: ms-settle .24s var(--ms-ease) both;
+}
+
+/* a pinned thread says so in the list, not only on the button */
+#history-list label.selected span::first-line { color: var(--ms-accent); }
+
 /* ===== 7. Keyboard focus, motion, keyframes ============================= */
 #app-shell button:focus-visible,
 #app-shell summary:focus-visible,
@@ -1657,6 +2187,10 @@ gradio-app { display: block; width: 100%; }
 ::selection { background: rgb(var(--ms-accent-rgb) / .3); }
 
 @keyframes ms-rise    { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes ms-settle  { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes ms-drop    { from { opacity: 0; transform: translateY(-6px) scale(.98); }
+                        to   { opacity: 1; transform: none; } }
+@keyframes ms-bob     { from { transform: translateY(0); } to { transform: translateY(3px); } }
 @keyframes ms-develop { from { opacity: 0; filter: blur(16px) brightness(1.35) saturate(.5); transform: scale(.985); }
                         to   { opacity: 1; filter: none; transform: none; } }
 @keyframes ms-sweep   { to { transform: translate(-50%, -50%) rotate(360deg); } }
@@ -1762,6 +2296,28 @@ with gr.Blocks(
                     elem_id="history-list",
                 )
 
+            with gr.Row(elem_id="manage-row"):
+                pin_chat = gr.Button(
+                    "Unpin" if initial_pinned else "Pin",
+                    variant="secondary",
+                    elem_id="pin-chat",
+                    elem_classes=["ms-btn--on"] if initial_pinned else [],
+                    scale=1,
+                )
+                duplicate_chat = gr.Button(
+                    "Duplicate", variant="secondary",
+                    elem_id="duplicate-chat", scale=1,
+                )
+
+            rename_title = gr.Textbox(
+                placeholder="Name this conversation",
+                value=initial_title,
+                show_label=False,
+                container=False,
+                elem_id="rename-title",
+                max_lines=1,
+            )
+
             with gr.Row():
                 clear_chat = gr.Button(
                     "Clear chat", variant="secondary", elem_id="clear-chat",
@@ -1771,6 +2327,14 @@ with gr.Blocks(
                     "Delete conversation", variant="secondary",
                     elem_id="delete-chat", scale=1,
                 )
+
+            with gr.Row():
+                export_chat = gr.Button(
+                    "Export thread", variant="secondary", elem_id="export-chat",
+                    scale=1,
+                )
+
+            export_note = gr.HTML("", elem_id="export-note")
 
             with gr.Accordion(
                 "Generation settings",
@@ -1839,26 +2403,37 @@ with gr.Blocks(
                         elem_id="clinical-toggle",
                     )
 
-            chatbot = gr.Chatbot(
-                value=_render_conversation(initial_conversation_id),
-                type="messages",
-                height=None,
-                placeholder=(
-                    "**Describe a lesion to begin**\n\n"
-                    "Diagnosis, category and body site work best - "
-                    "try *melanoma, malignant, back*"
-                ),
-                show_label=False,
-                elem_id="conversation-view",
-                layout="bubble",
-                bubble_full_width=False,
-                sanitize_html=True,
+            # One meta row directly above the chat: category + settings on the
+            # left, the live token count held on the right.
+            composer_context = gr.HTML(
+                sync_context("", *initial_updates[:5]), elem_id="meta-bar",
             )
 
-            with gr.Column(elem_id="composer"):
-                composer_context = gr.HTML(
-                    sync_context("", *initial_updates[:5]), elem_id="composer-context",
+            with gr.Column(elem_id="scroll-anchor"):
+                chatbot = gr.Chatbot(
+                    value=_render_conversation(initial_conversation_id),
+                    type="messages",
+                    height=None,
+                    placeholder=(
+                        "**Describe a lesion to begin**\n\n"
+                        "Diagnosis, category and body site work best - "
+                        "try *melanoma, malignant, back*"
+                    ),
+                    show_label=False,
+                    elem_id="conversation-view",
+                    layout="bubble",
+                    bubble_full_width=False,
+                    sanitize_html=True,
                 )
+                scroll_controls = gr.HTML(
+                    '<button class="ms-jump" data-target="conversation-view" '
+                    'type="button" aria-label="Jump to latest" hidden>'
+                    '<span class="ms-jump__arrow" aria-hidden="true"></span>'
+                    "</button>",
+                    elem_id="scroll-controls",
+                )
+
+            with gr.Column(elem_id="composer"):
                 prompt = gr.Textbox(
                     placeholder=(
                         "Diagnosis, category, body site - e.g. "
@@ -1890,12 +2465,7 @@ with gr.Blocks(
         chatbot, active_conversation, history_selector, history_empty,
         image_type, medical_prompt_enabled, steps, guidance_scale, seed,
         negative_prompt, composer_context, delete_chat, armed_delete,
-        history_search,
-    ]
-    select_outputs = [
-        chatbot, active_conversation, image_type, medical_prompt_enabled,
-        steps, guidance_scale, seed, negative_prompt, composer_context,
-        delete_chat, armed_delete,
+        history_search, pin_chat, rename_title, export_note,
     ]
 
     prompt.submit(
@@ -1917,6 +2487,8 @@ with gr.Blocks(
         inputs=[history_search],
         outputs=conversation_outputs,
         show_api=False,
+    ).then(
+        lambda: gr.update(value=""), outputs=[prompt], show_api=False,
     )
 
     # `.input` fires only on a real user click. `.change` also fired when the
@@ -1924,21 +2496,52 @@ with gr.Blocks(
     history_selector.input(
         select_conversation,
         inputs=[history_selector, history_search],
-        outputs=select_outputs,
+        outputs=conversation_outputs,
         show_api=False,
     )
 
     delete_chat.click(
         arm_delete,
         inputs=[active_conversation, armed_delete],
-        outputs=conversation_outputs[:-1],
+        outputs=conversation_outputs,
         show_api=False,
     )
 
     clear_chat.click(
         clear_conversation,
         inputs=[active_conversation, history_search],
-        outputs=[chatbot, history_selector, history_empty, armed_delete],
+        outputs=conversation_outputs,
+        show_api=False,
+    )
+
+    pin_chat.click(
+        toggle_pin,
+        inputs=[active_conversation, history_search],
+        outputs=conversation_outputs,
+        show_api=False,
+    )
+
+    duplicate_chat.click(
+        duplicate_conversation,
+        inputs=[active_conversation, history_search],
+        outputs=conversation_outputs,
+        show_api=False,
+    )
+
+    # Renaming commits on Enter or on losing focus, so it never fires while
+    # the user is still typing a name.
+    for event in (rename_title.submit, rename_title.blur):
+        event(
+            rename_conversation_from_ui,
+            inputs=[active_conversation, rename_title],
+            outputs=[history_selector, history_empty, rename_title],
+            show_api=False,
+        )
+
+    export_chat.click(
+        export_conversation,
+        inputs=[active_conversation],
+        outputs=[export_note],
         show_api=False,
     )
 

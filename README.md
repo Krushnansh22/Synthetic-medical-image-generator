@@ -1,4 +1,4 @@
-# Medsynth: train once with `python train.py`, use the model forever
+# Medsynth: Synthetic medical image generator
 
 One command fine-tunes Stable Diffusion 1.5 (LoRA, on your NVIDIA GPU) on three public
 skin-image datasets and saves the result **inside this project folder**. `main.py` loads only
