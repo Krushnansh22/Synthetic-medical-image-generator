@@ -64,28 +64,139 @@ def initialize_database():
                 ON conversations(updated_at DESC);
             """
         )
+        _migrate(connection)
 
 
-def create_conversation():
+# Generation settings are stored per conversation so that switching between
+# threads in the sidebar restores the exact setup that conversation was made
+# with, and so a reload never silently drops a hand-tuned configuration.
+SETTINGS_DEFAULTS: dict[str, object] = {
+    "image_type": "Dermoscopy",
+    "clinical": 1,
+    "steps": 30,
+    "guidance": 6.5,
+    "seed": -1,
+    "negative_prompt": "",
+}
+
+_SETTINGS_COLUMNS = {
+    "image_type": "TEXT NOT NULL DEFAULT 'Dermoscopy'",
+    "clinical": "INTEGER NOT NULL DEFAULT 1",
+    "steps": "INTEGER NOT NULL DEFAULT 30",
+    "guidance": "REAL NOT NULL DEFAULT 6.5",
+    "seed": "INTEGER NOT NULL DEFAULT -1",
+    "negative_prompt": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _migrate(connection):
+    """Add columns that older databases do not have yet."""
+    existing = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(conversations)")
+    }
+    for name, definition in _SETTINGS_COLUMNS.items():
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE conversations ADD COLUMN {name} {definition}"
+            )
+
+
+def create_conversation(settings=None):
     conversation_id = uuid4().hex
     with _connection() as connection:
         connection.execute(
             "INSERT INTO conversations (id) VALUES (?)",
             (conversation_id,),
         )
+    if settings:
+        save_settings(conversation_id, **settings)
     return conversation_id
 
 
-def list_conversations():
+def list_conversations(query=""):
+    """All conversations, most recently active first, with activity counts.
+
+    The counts let the sidebar show at a glance which threads actually produced
+    images without opening them. `query` narrows the list by conversation title
+    or by anything said inside it, so old prompts stay findable.
+    """
+    needle = f"%{(query or '').strip()}%"
     with _connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, title, created_at, updated_at
-            FROM conversations
-            ORDER BY updated_at DESC, id DESC
-            """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   COALESCE(m.message_count, 0) AS message_count,
+                   COALESCE(m.image_count, 0)  AS image_count
+            FROM conversations AS c
+            LEFT JOIN (
+                SELECT conversation_id,
+                       COUNT(*)                AS message_count,
+                       SUM(image IS NOT NULL)  AS image_count
+                FROM messages
+                GROUP BY conversation_id
+            ) AS m ON m.conversation_id = c.id
+            WHERE ? = '%'
+               OR c.title LIKE ?
+               OR EXISTS (
+                    SELECT 1 FROM messages AS hit
+                    WHERE hit.conversation_id = c.id
+                      AND hit.content LIKE ?
+               )
+            ORDER BY c.updated_at DESC, c.id DESC
+            """,
+            (needle, needle, needle),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_settings(conversation_id):
+    """The generation settings stored on a conversation, with defaults filled in."""
+    settings = dict(SETTINGS_DEFAULTS)
+    if not conversation_id:
+        return settings
+
+    with _connection() as connection:
+        row = connection.execute(
+            f"SELECT {', '.join(_SETTINGS_COLUMNS)} "
+            "FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+
+    if row is None:
+        return settings
+
+    stored = dict(row)
+    stored["clinical"] = bool(stored.get("clinical", 1))
+    settings.update(stored)
+    return settings
+
+
+def save_settings(conversation_id, **fields):
+    """Persist a subset of the generation settings on one conversation."""
+    if not conversation_id:
+        return get_settings(conversation_id)
+
+    updates = {
+        key: int(bool(value)) if key == "clinical" else value
+        for key, value in fields.items()
+        if key in _SETTINGS_COLUMNS
+    }
+    if not updates:
+        return get_settings(conversation_id)
+
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _connection() as connection:
+        connection.execute(
+            f"UPDATE conversations SET {assignments} WHERE id = ?",
+            (*updates.values(), conversation_id),
+        )
+    return get_settings(conversation_id)
+
+
+def reset_settings(conversation_id):
+    """Restore the shipped defaults for one conversation."""
+    return save_settings(conversation_id, **SETTINGS_DEFAULTS)
 
 
 def get_messages(conversation_id):
@@ -152,6 +263,48 @@ def add_message(
                 """,
                 (conversation_id,),
             )
+
+
+def rename_conversation(conversation_id, title):
+    """Give a conversation a human-readable name of its own."""
+    title = " ".join((title or "").split())
+    if not conversation_id or not title:
+        return False
+
+    with _connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE conversations
+            SET title = ?, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            WHERE id = ?
+            """,
+            (title[:64], conversation_id),
+        )
+    return cursor.rowcount > 0
+
+
+def clear_messages(conversation_id):
+    """Drop every message and image in a conversation but keep the thread.
+
+    Used by "Clear chat": the conversation stays in the sidebar, the title
+    resets so the next prompt names it again, and generation settings survive.
+    """
+    if not conversation_id:
+        return 0
+
+    with _connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        connection.execute(
+            "UPDATE conversations "
+            "SET title = 'New conversation', "
+            "    updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') "
+            "WHERE id = ?",
+            (conversation_id,),
+        )
+    return cursor.rowcount
 
 
 def delete_conversation(conversation_id):
